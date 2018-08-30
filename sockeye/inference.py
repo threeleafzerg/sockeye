@@ -356,6 +356,7 @@ def load_models(context: mx.context.Context,
                 beam_size: int,
                 batch_size: int,
                 model_folders: List[str],
+                vocabs_folders : List[str],
                 checkpoints: Optional[List[int]] = None,
                 softmax_temperature: Optional[float] = None,
                 max_output_length_num_stds: int = C.DEFAULT_NUM_STD_MAX_OUTPUT_LENGTH,
@@ -373,6 +374,7 @@ def load_models(context: mx.context.Context,
     :param beam_size: Beam size.
     :param batch_size: Batch size.
     :param model_folders: List of model folders to load models from.
+    :param vocabs_folders: List of vocabulary folders
     :param checkpoints: List of checkpoints to use for each model in model_folders. Use None to load best checkpoint.
     :param softmax_temperature: Optional parameter to control steepness of softmax distribution.
     :param max_output_length_num_stds: Number of standard deviations to add to mean target-source length ratio
@@ -394,9 +396,9 @@ def load_models(context: mx.context.Context,
     if checkpoints is None:
         checkpoints = [None] * len(model_folders)
 
-    for model_folder, checkpoint in zip(model_folders, checkpoints):
-        model_source_vocabs = vocab.load_source_vocabs(model_folder)
-        model_target_vocab = vocab.load_target_vocab(model_folder)
+    for model_folder, vocabs_folder, checkpoint in zip(model_folders, vocabs_folers, checkpoints):
+        model_source_vocabs = vocab.load_source_vocabs(vocabs_folder)
+        model_target_vocab = vocab.load_target_vocab(vocabs_folder)
         source_vocabs.append(model_source_vocabs)
         target_vocabs.append(model_target_vocab)
 

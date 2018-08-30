@@ -332,6 +332,12 @@ class TrainingModel(model.SockeyeModel):
         self.aux_params = aux_params
         super().save_params_to_file(fname)
 
+    def update_params(self):
+        arg_params, aux_params = self.module.get_params()
+        self.module.set_params(arg_params, aux_params)
+        self.params = arg_params
+        self.aux_params = aux_params
+
     def load_params_from_file(self, fname: str, allow_missing_params: bool = False):
         """
         Loads parameters from a file and sets the parameters of the underlying module and this model instance.
@@ -496,19 +502,29 @@ class EarlyStoppingTrainer:
         self._initialize_parameters(existing_parameters, allow_missing_parameters)
         self._initialize_optimizer()
 
+        kvstore = self.optimizer_config.kvstore
+        # Sync across multi-node in case that other nodes check resume_training after master node save training
+        # state
+        if 'dist' in kvstore.type:
+            utils.mn_sync(kvstore)
         resume_training = os.path.exists(self.training_state_dirname)
         if resume_training:
             logger.info("Found partial training in '%s'. Resuming from saved state.", self.training_state_dirname)
-            utils.check_condition('dist' not in self.optimizer_config.kvstore,
+            utils.check_condition('dist' not in kvstore.type,
                                   "Training continuation not supported with distributed training.")
             self._load_training_state(train_iter)
         else:
             self.state = TrainState(early_stopping_metric)
-            self._save_params()
-            self._update_best_params_link()
-            self._save_training_state(train_iter)
-            self._update_best_optimizer_states(lr_decay_opt_states_reset)
-            self.tflogger.log_graph(self.model.current_module.symbol)
+            if kvstore.rank == 0:
+                self._save_params()
+                self._update_best_params_link()
+                self._save_training_state(train_iter)
+                self._update_best_optimizer_states(lr_decay_opt_states_reset)
+                self.tflogger.log_graph(self.model.current_module.symbol)
+            else:
+                self._update_params()
+            if 'dist' in kvstore.type:
+                utils.mn_sync(kvstore)
             logger.info("Training started.")
 
         metric_train, metric_val, metric_loss = self._create_metrics(metrics, self.model.optimizer, self.model.loss)
@@ -523,7 +539,10 @@ class EarlyStoppingTrainer:
         speedometer = Speedometer(frequency=C.MEASURE_SPEED_EVERY, auto_reset=False)
         tic = time.time()
 
-        next_data_batch = train_iter.next()
+        if 'dist' not in kvstore.type:
+            next_data_batch = train_iter.next()
+        else:
+            next_data_batch = train_iter.mn_next()
         while True:
 
             if max_epochs is not None and self.state.epoch == max_epochs:
@@ -548,11 +567,17 @@ class EarlyStoppingTrainer:
             self.state.updates += 1
             self.state.samples += batch_num_samples
 
-            if not train_iter.iter_next():
-                self.state.epoch += 1
-                train_iter.reset()
+            if 'dist' not in kvstore.type:
+                if not train_iter.iter_next():
+                    self.state.epoch += 1
+                    train_iter.reset()
+                next_data_batch = train_iter.next()
+            else:
+                if not train_iter.mn_iter_next():
+                    self.state.epoch += 1
+                    train_iter.mn_reset()
+                next_data_batch = train_iter.mn_next()
 
-            next_data_batch = train_iter.next()
             self.model.prepare_batch(next_data_batch)
 
             speedometer(self.state.epoch, self.state.updates, batch_num_samples, batch_num_tokens, metric_train)
@@ -564,7 +589,12 @@ class EarlyStoppingTrainer:
                 time_cost = time.time() - tic
                 self.state.checkpoint += 1
                 # (1) save parameters and evaluate on validation data
-                self._save_params()
+                if kvstore.rank == 0:
+                    self._save_params()
+                else:
+                    self._update_params()
+                if 'dist' in kvstore.type:
+                    utils.mn_sync(kvstore)
                 logger.info("Checkpoint [%d]\tUpdates=%d Epoch=%d Samples=%d Time-cost=%.3f Updates/sec=%.3f",
                             self.state.checkpoint, self.state.updates, self.state.epoch,
                             self.state.samples, time_cost, checkpoint_frequency / time_cost)
@@ -589,8 +619,9 @@ class EarlyStoppingTrainer:
                         has_improved = True
 
                 if has_improved:
-                    self._update_best_params_link()
-                    self._update_best_optimizer_states(lr_decay_opt_states_reset)
+                    if kvstore.rank == 0:
+                        self._update_best_params_link()
+                        self._update_best_optimizer_states(lr_decay_opt_states_reset)
                     self.state.num_not_improved = 0
                     logger.info("Validation-%s improved to %f (delta=%f).", early_stopping_metric,
                                 self.state.best_metric, abs(self.state.best_metric - previous_best))
@@ -598,6 +629,8 @@ class EarlyStoppingTrainer:
                     self.state.num_not_improved += 1
                     logger.info("Validation-%s has not improved for %d checkpoints, best so far: %f",
                                 early_stopping_metric, self.state.num_not_improved, self.state.best_metric)
+                    if 'dist' in kvstore.type:
+                        utils.mn_sync(kvstore)
 
                 # If using an extended optimizer, provide extra state information about the current checkpoint
                 # Loss: optimized metric
@@ -613,7 +646,10 @@ class EarlyStoppingTrainer:
                 self._adjust_learning_rate(has_improved, lr_decay_param_reset, lr_decay_opt_states_reset)
 
                 # (6) save training state
-                self._save_training_state(train_iter)
+                if kvstore.rank == 0:
+                    self._save_training_state(train_iter)
+                if 'dist' in kvstore.type:
+                    utils.mn_sync(kvstore)
 
                 # (7) determine stopping
                 if 0 <= max_num_not_improved <= self.state.num_not_improved:
@@ -640,7 +676,8 @@ class EarlyStoppingTrainer:
 
                 tic = time.time()
 
-        self._cleanup(lr_decay_opt_states_reset, process_manager=process_manager)
+        if kvstore.rank == 0:
+            self._cleanup(lr_decay_opt_states_reset, process_manager=process_manager)
         logger.info("Training finished. Best checkpoint: %d. Best validation %s: %.6f",
                     self.state.best_checkpoint, early_stopping_metric, self.state.best_metric)
         return self.state.best_metric
@@ -886,16 +923,16 @@ class EarlyStoppingTrainer:
         for metric in metrics:
             utils.check_condition(metric in C.METRICS, "Unknown metric to track during training: %s" % metric)
 
-        if 'dist' in self.optimizer_config.kvstore:
+        if 'dist' in self.optimizer_config.kvstore.type:
             # In distributed training the optimizer will run remotely. For eve we however need to pass information about
             # the loss, which is not possible anymore by means of accessing self.module._curr_module._optimizer.
             utils.check_condition(self.optimizer_config.name != C.OPTIMIZER_EVE,
                                   "Eve optimizer not supported with distributed training.")
-            utils.check_condition(
-                not issubclass(type(self.optimizer_config.lr_scheduler),
-                               lr_scheduler.AdaptiveLearningRateScheduler),
-                "Adaptive learning rate schedulers not supported with a dist kvstore. "
-                "Try a fixed schedule such as %s." % C.LR_SCHEDULER_FIXED_RATE_INV_SQRT_T)
+            #utils.check_condition(
+            #    not issubclass(type(self.optimizer_config.lr_scheduler),
+            #                   lr_scheduler.AdaptiveLearningRateScheduler),
+            #    "Adaptive learning rate schedulers not supported with a dist kvstore. "
+            #    "Try a fixed schedule such as %s." % C.LR_SCHEDULER_FIXED_RATE_INV_SQRT_T)
             utils.check_condition(not lr_decay_param_reset, "Parameter reset when the learning rate decays not "
                                                             "supported with distributed training.")
             utils.check_condition(lr_decay_opt_states_reset == C.LR_DECAY_OPT_STATES_RESET_OFF,
@@ -917,6 +954,12 @@ class EarlyStoppingTrainer:
         self.model.save_params_to_file(self.current_params_fname)
         utils.cleanup_params_files(self.model.output_dir, self.max_params_files_to_keep, self.state.checkpoint,
                                    self.state.best_checkpoint)
+
+    def _update_params(self):
+        """
+        Update model parameter
+        """
+        self.model.update_params()
 
     def _save_training_state(self, train_iter: data_io.BaseParallelSampleIter):
         """

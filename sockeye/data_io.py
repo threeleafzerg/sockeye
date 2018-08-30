@@ -672,9 +672,11 @@ def get_prepared_data_iters(prepared_data_dir: str,
                             batch_size: int,
                             batch_by_words: bool,
                             batch_num_devices: int,
-                            fill_up: str) -> Tuple['BaseParallelSampleIter',
-                                                   'BaseParallelSampleIter',
-                                                   'DataConfig', List[vocab.Vocab], vocab.Vocab]:
+                            fill_up: str,
+                            nworkers: int,
+                            rank: int) -> Tuple['BaseParallelSampleIter',
+                                                'BaseParallelSampleIter',
+                                                'DataConfig', List[vocab.Vocab], vocab.Vocab]:
     logger.info("===============================")
     logger.info("Creating training data iterator")
     logger.info("===============================")
@@ -765,9 +767,11 @@ def get_training_data_iters(sources: List[str],
                             max_seq_len_source: int,
                             max_seq_len_target: int,
                             bucketing: bool,
-                            bucket_width: int) -> Tuple['BaseParallelSampleIter',
-                                                        'BaseParallelSampleIter',
-                                                        'DataConfig', 'DataInfo']:
+                            bucket_width: int,
+                            nworkers: int,
+                            rank: int) -> Tuple['BaseParallelSampleIter',
+                                                'BaseParallelSampleIter',
+                                                'DataConfig', 'DataInfo']:
     """
     Returns data iterators for training and validation data.
 
@@ -1361,6 +1365,8 @@ class BaseParallelSampleIter(mx.io.DataIter):
                  buckets,
                  batch_size,
                  bucket_batch_sizes,
+                 nworkers,
+                 rank,
                  source_data_name,
                  target_data_name,
                  label_name,
@@ -1371,6 +1377,8 @@ class BaseParallelSampleIter(mx.io.DataIter):
         self.buckets = list(buckets)
         self.default_bucket_key = get_default_bucket_key(self.buckets)
         self.bucket_batch_sizes = bucket_batch_sizes
+        self.nworkers = nworkers
+        self.rank = rank
         self.source_data_name = source_data_name
         self.target_data_name = target_data_name
         self.label_name = label_name
@@ -1413,6 +1421,18 @@ class BaseParallelSampleIter(mx.io.DataIter):
         pass
 
     @abstractmethod
+    def mn_reset(self):
+        pass
+
+    @abstractmethod
+    def mn_iter_next(self) -> bool:
+        pass
+
+    @abstractmethod
+    def mn_next(self) -> mx.io.DataBatch:
+        pass
+
+    @abstractmethod
     def save_state(self, fname: str):
         pass
 
@@ -1433,14 +1453,17 @@ class ShardedParallelSampleIter(BaseParallelSampleIter):
                  batch_size,
                  bucket_batch_sizes,
                  fill_up: str,
+                 nworkers = 1,
+                 rank = 0,
                  source_data_name=C.SOURCE_NAME,
                  target_data_name=C.TARGET_NAME,
                  label_name=C.TARGET_LABEL_NAME,
                  num_factors: int = 1,
                  dtype='float32') -> None:
         super().__init__(buckets=buckets, batch_size=batch_size, bucket_batch_sizes=bucket_batch_sizes,
-                         source_data_name=source_data_name, target_data_name=target_data_name,
-                         label_name=label_name, num_factors=num_factors, dtype=dtype)
+                         nworkers=nworkers, rank=rank, source_data_name=source_data_name, 
+                         target_data_name=target_data_name, label_name=label_name, 
+                         num_factors=num_factors, dtype=dtype)
         assert len(shards_fnames) > 0
         self.shards_fnames = list(shards_fnames)
         self.shard_index = -1
@@ -1458,6 +1481,8 @@ class ShardedParallelSampleIter(BaseParallelSampleIter):
                                              buckets=self.buckets,
                                              batch_size=self.batch_size,
                                              bucket_batch_sizes=self.bucket_batch_sizes,
+                                             nworkers=self.nworkers,
+                                             rank=self.rank,
                                              source_data_name=self.source_data_name,
                                              target_data_name=self.target_data_name,
                                              num_factors=self.num_factors)
@@ -1499,6 +1524,43 @@ class ShardedParallelSampleIter(BaseParallelSampleIter):
                 raise StopIteration
         return self.shard_iter.next()
 
+    def mn_reset(self):
+        if len(self.shards_fnames) > 1:
+            logger.info("Shuffling the shards.")
+            # Making sure to not repeat a shard:
+            if self.shard_index < 0:
+                current_shard_fname = ""
+            else:
+                current_shard_fname = self.shards_fnames[self.shard_index]
+            remaining_shards = [shard for shard in self.shards_fnames if shard != current_shard_fname]
+            next_shard_fname = random.choice(remaining_shards)
+            remaining_shards = [shard for shard in self.shards_fnames if shard != next_shard_fname]
+            random.shuffle(remaining_shards)
+
+            self.shards_fnames = [next_shard_fname] + remaining_shards
+
+            self.shard_index = 0
+            self._load_shard()
+        else:
+            if self.shard_index < 0:
+                self.shard_index = 0
+                self._load_shard()
+            # We can just reset the shard_iter as we only have a single shard
+            self.shard_iter.mn_reset()
+
+    def mn_iter_next(self) -> bool:
+        next_shard_index = self.shard_index + 1
+        return self.shard_iter.mn_iter_next() or next_shard_index < len(self.shards_fnames)
+
+    def mn_next(self) -> mx.io.DataBatch:
+        if not self.shard_iter.mn_iter_next():
+            if self.shard_index < len(self.shards_fnames) - 1:
+                self.shard_index += 1
+                self._load_shard()
+            else:
+                raise StopIteration
+        return self.shard_iter.mn_next()
+
     def save_state(self, fname: str):
         with open(fname, "wb") as fp:
             pickle.dump(self.shards_fnames, fp)
@@ -1524,14 +1586,17 @@ class ParallelSampleIter(BaseParallelSampleIter):
                  buckets,
                  batch_size,
                  bucket_batch_sizes,
+                 nworkers = 1,
+                 rank = 0,
                  source_data_name=C.SOURCE_NAME,
                  target_data_name=C.TARGET_NAME,
                  label_name=C.TARGET_LABEL_NAME,
                  num_factors: int = 1,
                  dtype='float32') -> None:
         super().__init__(buckets=buckets, batch_size=batch_size, bucket_batch_sizes=bucket_batch_sizes,
-                         source_data_name=source_data_name, target_data_name=target_data_name,
-                         label_name=label_name, num_factors=num_factors, dtype=dtype)
+                         nworkers=nworkers, rank=rank, source_data_name=source_data_name,
+                         target_data_name=target_data_name, label_name=label_name,
+                         num_factors=num_factors, dtype=dtype)
 
         # create independent lists to be shuffled
         self.data = ParallelDataSet(list(data.source), list(data.target), list(data.label))
@@ -1544,6 +1609,8 @@ class ParallelSampleIter(BaseParallelSampleIter):
                                           for i in range(len(self.data))]
         self.data_permutations = [mx.nd.arange(0, max(1, self.data.source[i].shape[0]))
                                   for i in range(len(self.data))]
+        self.first_mn_next = True
+        self.mn_curr_batch_index = 0
 
         self.reset()
 
@@ -1593,6 +1660,45 @@ class ParallelSampleIter(BaseParallelSampleIter):
         return mx.io.DataBatch(data, label,
                                pad=0, index=None, bucket_key=self.buckets[i],
                                provide_data=provide_data, provide_label=provide_label)
+
+    def mn_reset(self):
+        """
+        Resets and reshuffles the data considering multi-node
+        """
+        if self.mn_curr_batch_index > len(self.batch_indices):
+        # In the last iteration, this condition corresponds to the node which mn_curr_batch_index
+        # exceed total batch index, we directly set mn_curr_batch_index to curr_batch_index
+            self.mn_curr_batch_index = self.curr_batch_index
+        else:
+        # In the last iteration, this condition corresponds to the node which mn_curr_batch_index
+        # doesn't exceed total batch index, we did trick on mn_curr_batch_index so that
+        # in next reset mn_curr_batch_index will be equal curr_batch_index
+            self.mn_curr_batch_index = self.mn_curr_batch_index - len(self.batch_indices)
+
+    def mn_iter_next(self) -> bool:
+        """
+        True if iterator can return another batch considering multi-node
+        """
+        return (self.mn_curr_batch_index - (self.rank + 1) + self.nworkers) < len(self.batch_indices)
+
+    def mn_next(self) -> mx.io.DataBatch:
+        """
+        Returns the next batch from the data iterator considering multi-node.
+        """
+        if self.first_mn_next:
+            for i in range(0, self.rank + 1):
+                if not self.iter_next():
+                    self.reset()
+                data_batch = self.next()
+                self.mn_curr_batch_index += 1
+            self.first_mn_next = False
+        else:
+            for i in range(0, self.nworkers):
+                if not self.iter_next():
+                    self.reset()
+                data_batch = self.next()
+                self.mn_curr_batch_index += 1
+        return data_batch    
 
     def save_state(self, fname: str):
         """

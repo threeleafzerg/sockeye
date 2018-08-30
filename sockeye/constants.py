@@ -272,9 +272,10 @@ KVSTORE_SYNC = "dist_sync"
 KVSTORE_DIST_DEVICE_SYNC = "dist_device_sync"
 KVSTORE_DIST_ASYNC = "dist_async"
 KVSTORE_NCCL = 'nccl'
+KVSTORE_DIST_ALLREDUCE = 'dist_sync_allreduce'
 KVSTORE_TYPES = [KVSTORE_DEVICE, KVSTORE_LOCAL, KVSTORE_SYNC,
                  KVSTORE_DIST_DEVICE_SYNC, KVSTORE_DIST_ASYNC,
-                 KVSTORE_NCCL]
+                 KVSTORE_NCCL, KVSTORE_DIST_ALLREDUCE]
 
 # Training constants
 OPTIMIZER_ADAM = "adam"

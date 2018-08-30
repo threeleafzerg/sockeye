@@ -154,7 +154,8 @@ def check_resume(args: argparse.Namespace, output_folder: str) -> bool:
 
 def create_checkpoint_decoder(args: argparse.Namespace,
                               exit_stack: ExitStack,
-                              train_context: List[mx.Context]) -> Optional[checkpoint_decoder.CheckpointDecoder]:
+                              train_context: List[mx.Context],
+                              vocab: str) -> Optional[checkpoint_decoder.CheckpointDecoder]:
     """
     Returns a checkpoint decoder or None.
 
@@ -189,6 +190,7 @@ def create_checkpoint_decoder(args: argparse.Namespace,
                                                 inputs=[args.validation_source] + args.validation_source_factors,
                                                 references=args.validation_target,
                                                 model=args.output,
+                                                vocab=vocab,
                                                 sample_size=sample_size)
 
 
@@ -219,10 +221,12 @@ def create_data_iters_and_vocabs(args: argparse.Namespace,
                                  max_seq_len_target: int,
                                  shared_vocab: bool,
                                  resume_training: bool,
-                                 output_folder: str) -> Tuple['data_io.BaseParallelSampleIter',
-                                                              'data_io.BaseParallelSampleIter',
-                                                              'data_io.DataConfig',
-                                                              List[vocab.Vocab], vocab.Vocab]:
+                                 output_folder: str,
+                                 nworkers: int,
+                                 rank: int) -> Tuple['data_io.BaseParallelSampleIter',
+                                                     'data_io.BaseParallelSampleIter',
+                                                     'data_io.DataConfig',
+                                                     List[vocab.Vocab], vocab.Vocab]:
     """
     Create the data iterators and the vocabularies.
 
@@ -343,7 +347,9 @@ def create_data_iters_and_vocabs(args: argparse.Namespace,
             max_seq_len_source=max_seq_len_source,
             max_seq_len_target=max_seq_len_target,
             bucketing=not args.no_bucketing,
-            bucket_width=args.bucket_width)
+            bucket_width=args.bucket_width,
+            nworkers=nworkers,
+            rank=rank)
 
         data_info_fname = os.path.join(output_folder, C.DATA_INFO)
         logger.info("Writing data config to '%s'", data_info_fname)
@@ -688,7 +694,7 @@ def gradient_compression_params(args: argparse.Namespace) -> Optional[Dict[str, 
         return {'type': args.gradient_compression_type, 'threshold': args.gradient_compression_threshold}
 
 
-def create_optimizer_config(args: argparse.Namespace, source_vocab_sizes: List[int],
+def create_optimizer_config(args: argparse.Namespace, source_vocab_sizes: List[int], kvstore: mx.kvstore,
                             extra_initializers: List[Tuple[str, mx.initializer.Initializer]] = None) -> OptimizerConfig:
     """
     Returns an OptimizerConfig.
@@ -719,7 +725,8 @@ def create_optimizer_config(args: argparse.Namespace, source_vocab_sizes: List[i
         optimizer_params["rescale_grad"] = 1.0
     elif args.loss_normalization_type == C.LOSS_NORM_BATCH:
         # Making MXNet module API's default scaling factor explicit
-        optimizer_params["rescale_grad"] = 1.0 / args.batch_size
+        # Already take multi-node case into account
+        optimizer_params["rescale_grad"] = 1.0 / (args.batch_size * kvstore.num_workers)
     # Manually specified params
     if args.optimizer_params:
         optimizer_params.update(args.optimizer_params)
@@ -743,7 +750,7 @@ def create_optimizer_config(args: argparse.Namespace, source_vocab_sizes: List[i
 
     config = OptimizerConfig(name=args.optimizer,
                              params=optimizer_params,
-                             kvstore=args.kvstore,
+                             kvstore=kvstore,
                              initializer=weight_init,
                              gradient_clipping_type=gradient_clipping_type,
                              gradient_clipping_threshold=gradient_clipping_threshold)
@@ -770,16 +777,36 @@ def train(args: argparse.Namespace):
 
     utils.seed_rngs(args.seed)
 
+    # kvstore
+    kv = mx.kvstore.create(args.kvstore)
+
     check_arg_compatibility(args)
     output_folder = os.path.abspath(args.output)
-    resume_training = check_resume(args, output_folder)
+    if kv.rank == 0:
+        resume_training = check_resume(args, output_folder)
+    else:
+        resume_training = False
+
+    if 'dist' in kv.type:
+        utils.mn_sync(kv)
+
+    if 'dist' in kv.type:
+        local_output_folder = os.path.join(output_folder, str(kv.rank))
+    else:
+        local_output_folder = output_folder
+
+    if local_output_folder != output_folder:
+        if not os.path.exists(local_output_folder):
+            os.makedirs(local_output_folder)
 
     global logger
     logger = setup_main_logger(__name__,
                                file_logging=True,
-                               console=not args.quiet, path=os.path.join(output_folder, C.LOG_NAME))
+                               console=not args.quiet, path=os.path.join(local_output_folder, C.LOG_NAME))
     utils.log_basic_info(args)
-    arguments.save_args(args, os.path.join(output_folder, C.ARGS_STATE_NAME))
+    # Only master save the args
+    if kv.rank == 0:
+        arguments.save_args(args, os.path.join(output_folder, C.ARGS_STATE_NAME))
 
     max_seq_len_source, max_seq_len_target = args.max_seq_len
     # The maximum length is the length before we add the BOS/EOS symbols
@@ -806,14 +833,16 @@ def train(args: argparse.Namespace):
             max_seq_len_target=max_seq_len_target,
             shared_vocab=use_shared_vocab(args),
             resume_training=resume_training,
-            output_folder=output_folder)
+            output_folder=local_output_folder,
+            nworkers=kv.num_workers,
+            rank=kv.rank)
         max_seq_len_source = config_data.max_seq_len_source
         max_seq_len_target = config_data.max_seq_len_target
 
         # Dump the vocabularies if we're just starting up
         if not resume_training:
-            vocab.save_source_vocabs(source_vocabs, output_folder)
-            vocab.save_target_vocab(target_vocab, output_folder)
+            vocab.save_source_vocabs(source_vocabs, local_output_folder)
+            vocab.save_target_vocab(target_vocab, local_output_folder)
 
         source_vocab_sizes = [len(v) for v in source_vocabs]
         target_vocab_size = len(target_vocab)
@@ -855,7 +884,7 @@ def train(args: argparse.Namespace):
             max_epochs = None
 
         trainer = training.EarlyStoppingTrainer(model=training_model,
-                                                optimizer_config=create_optimizer_config(args, source_vocab_sizes),
+                                                optimizer_config=create_optimizer_config(args, source_vocab_sizes, kv),
                                                 max_params_files_to_keep=args.keep_last_params,
                                                 source_vocabs=source_vocabs,
                                                 target_vocab=target_vocab)
@@ -874,7 +903,7 @@ def train(args: argparse.Namespace):
                     max_epochs=max_epochs,
                     lr_decay_param_reset=args.learning_rate_decay_param_reset,
                     lr_decay_opt_states_reset=args.learning_rate_decay_optimizer_states_reset,
-                    decoder=create_checkpoint_decoder(args, exit_stack, context),
+                    decoder=create_checkpoint_decoder(args, exit_stack, context, local_output_folder),
                     mxmonitor_pattern=args.monitor_pattern,
                     mxmonitor_stat_func=args.monitor_stat_func,
                     allow_missing_parameters=args.allow_missing_params or model_config.lhuc,

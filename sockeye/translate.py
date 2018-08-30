@@ -78,6 +78,7 @@ def run_translate(args: argparse.Namespace):
             beam_size=args.beam_size,
             batch_size=args.batch_size,
             model_folders=args.models,
+            vocabs_folders=args.models,
             checkpoints=args.checkpoints,
             softmax_temperature=args.softmax_temperature,
             max_output_length_num_stds=args.max_output_length_num_stds,

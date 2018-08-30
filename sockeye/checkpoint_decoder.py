@@ -60,6 +60,7 @@ class CheckpointDecoder:
                  inputs: List[str],
                  references: str,
                  model: str,
+                 vocab: str,
                  max_input_len: Optional[int] = None,
                  batch_size: int = 16,
                  beam_size: int = C.DEFAULT_BEAM_SIZE,
@@ -82,6 +83,7 @@ class CheckpointDecoder:
         self.length_penalty_beta = length_penalty_beta
         self.softmax_temperature = softmax_temperature
         self.model = model
+        self.vocab = vocab
 
         with ExitStack() as exit_stack:
             inputs_fins = [exit_stack.enter_context(data_io.smart_open(f)) for f in inputs]
@@ -130,6 +132,7 @@ class CheckpointDecoder:
             self.beam_size,
             self.batch_size,
             [self.model],
+            [self.vocab],
             [checkpoint],
             softmax_temperature=self.softmax_temperature,
             max_output_length_num_stds=self.max_output_length_num_stds)

@@ -35,7 +35,7 @@ class OptimizerConfig(config.Config):
     def __init__(self,
                  name: str,
                  params: Dict[str, Any],
-                 kvstore: str,
+                 kvstore: mx.kvstore,
                  initializer: mx.initializer.Initializer,
                  gradient_clipping_type: str,
                  gradient_clipping_threshold: Optional[float]) -> None:

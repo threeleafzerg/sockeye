@@ -917,3 +917,6 @@ def split(data: mx.nd.NDArray,
     if num_outputs == 1:
         return [ndarray_or_list]
     return ndarray_or_list
+
+def mn_sync(kvstore: mx.kvstore):
+    kvstore._barrier()

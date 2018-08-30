@@ -325,6 +325,7 @@ def run_train_translate(train_params: str,
                                                                   inputs=[dev_source_path],
                                                                   references=dev_target_path,
                                                                   model=model_path,
+                                                                  vocab=model_path,
                                                                   sample_size=sample_size,
                                                                   batch_size=2,
                                                                   beam_size=2)
