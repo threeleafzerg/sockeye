@@ -396,7 +396,7 @@ def load_models(context: mx.context.Context,
     if checkpoints is None:
         checkpoints = [None] * len(model_folders)
 
-    for model_folder, vocabs_folder, checkpoint in zip(model_folders, vocabs_folers, checkpoints):
+    for model_folder, vocabs_folder, checkpoint in zip(model_folders, vocabs_folders, checkpoints):
         model_source_vocabs = vocab.load_source_vocabs(vocabs_folder)
         model_target_vocab = vocab.load_target_vocab(vocabs_folder)
         source_vocabs.append(model_source_vocabs)
